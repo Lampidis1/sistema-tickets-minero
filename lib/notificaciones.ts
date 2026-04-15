@@ -1,394 +1,355 @@
-import { supabase } from './supabase'
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs';
+
+const supabase = createClientComponentClient();
 
 export type TipoNotificacion = 
-  | 'asignacion'           // Ticket asignado al técnico
-  | 'cambio_estado'        // Estado del ticket cambió
-  | 'emergencia'           // Ticket urgente/emergencia
-  | 'recordatorio'         // Recordatorio de ticket pendiente
-  | 'escalamiento'         // Ticket escalado a supervisor
-  | 'cierre'               // Ticket cerrado
-  | 'comentario'           // Nuevo comentario en ticket
+  | 'asignacion'
+  | 'emergencia'
+  | 'cambio_estado'
+  | 'recordatorio'
+  | 'escalamiento'
+  | 'cierre'
+  | 'comentario';
 
-export type CanalNotificacion = 'whatsapp' | 'email' | 'sms'
+export type CanalNotificacion = 'whatsapp' | 'email';
 
-export interface NotificacionConfig {
-  ticketId: string
-  usuarioId: string
-  tipo: TipoNotificacion
-  prioridad: number // 1=crítico, 2=alto, 3=medio, 4=bajo
-  canal?: CanalNotificacion[] // Por defecto usa preferencias del usuario
-  mensaje?: string // Mensaje personalizado (opcional)
-  metadata?: Record<string, any>
+export interface NotificacionParams {
+  ticket_id: string;
+  usuario_id: string;
+  tipo: TipoNotificacion;
+  canal: CanalNotificacion;
+  prioridad?: number; // 1=crítico, 2=alto, 3=medio, 4=bajo
+  datos_adicionales?: Record<string, any>;
 }
 
 /**
- * Envía notificación a un técnico
+ * Genera el mensaje personalizado según el tipo de notificación
  */
-export async function enviarNotificacion(config: NotificacionConfig): Promise<void> {
-  const { ticketId, usuarioId, tipo, prioridad, canal, mensaje, metadata } = config
-
-  // Obtener información del usuario
-  const { data: usuario, error: userError } = await supabase
-    .from('usuarios_autorizados')
-    .select('*')
-    .eq('id', usuarioId)
-    .single()
-
-  if (userError || !usuario) {
-    console.error('Error obteniendo usuario para notificación:', userError)
-    return
-  }
-
-  // Verificar preferencias de notificación
-  if (!usuario.activo) {
-    console.log(`Usuario ${usuario.nombre} inactivo, no se envía notificación`)
-    return
-  }
-
-  // Obtener información del ticket
-  const { data: ticket, error: ticketError } = await supabase
-    .from('tickets')
-    .select(`
-      *,
-      tipo_incidente:tipos_incidente(nombre),
-      equipo:equipos(codigo, tipo_equipo)
-    `)
-    .eq('id', ticketId)
-    .single()
-
-  if (ticketError || !ticket) {
-    console.error('Error obteniendo ticket:', ticketError)
-    return
-  }
-
-  // Determinar canales de envío
-  const canales = canal || determinarCanales(usuario, prioridad)
-
-  // Generar mensaje si no se proporcionó uno
-  const mensajeFinal = mensaje || generarMensajeNotificacion(tipo, ticket, usuario)
-
-  // Enviar por cada canal
-  for (const canalActual of canales) {
-    await enviarPorCanal(
-      canalActual,
-      usuario,
-      mensajeFinal,
-      ticketId,
-      tipo,
-      prioridad,
-      metadata
-    )
-  }
-}
-
-/**
- * Determina canales de notificación según preferencias y prioridad
- */
-function determinarCanales(usuario: any, prioridad: number): CanalNotificacion[] {
-  const canales: CanalNotificacion[] = []
-
-  // WhatsApp siempre para emergencias críticas
-  if (prioridad === 1) {
-    canales.push('whatsapp')
-  } else {
-    // Usar preferencias del usuario
-    if (usuario.notificaciones_push) {
-      canales.push('whatsapp')
-    }
-    if (usuario.notificaciones_email && usuario.email) {
-      canales.push('email')
-    }
-  }
-
-  // Si no hay canales, por defecto WhatsApp
-  if (canales.length === 0) {
-    canales.push('whatsapp')
-  }
-
-  return canales
-}
-
-/**
- * Genera mensaje de notificación según el tipo
- */
-function generarMensajeNotificacion(
+function generarMensaje(
   tipo: TipoNotificacion,
-  ticket: any,
-  usuario: any
+  datos: {
+    nombre_usuario: string;
+    numero_ticket: string;
+    equipo_codigo?: string;
+    tipo_incidente?: string;
+    prioridad?: number;
+    estado_anterior?: string;
+    estado_nuevo?: string;
+    comentario?: string;
+  }
 ): string {
-  const prioridadEmoji = {
-    1: '🔴',
-    2: '🟠',
-    3: '🟡',
-    4: '🟢'
-  }[ticket.prioridad] || '⚪'
-
-  const equipoCodigo = ticket.equipo?.codigo || ticket.equipo_codigo
-  const tipoIncidente = ticket.tipo_incidente?.nombre || 'No especificado'
+  const { nombre_usuario, numero_ticket, equipo_codigo, tipo_incidente } = datos;
 
   switch (tipo) {
     case 'asignacion':
-      return `🔔 *Nuevo Ticket Asignado*\n\n` +
-             `Hola *${usuario.nombre}*!\n\n` +
-             `Se te ha asignado un nuevo ticket:\n\n` +
-             `📋 Ticket: *${ticket.numero_ticket}*\n` +
-             `${prioridadEmoji} Prioridad: ${obtenerNombrePrioridad(ticket.prioridad)}\n` +
-             `🔧 Equipo: ${equipoCodigo}\n` +
-             `⚠️ Problema: ${tipoIncidente}\n` +
-             `📝 ${ticket.breve_descripcion}\n\n` +
-             `Por favor atiende este ticket lo antes posible.\n\n` +
-             `_Responde *OK* para confirmar recepción_`
+      return `👷 ¡Hola ${nombre_usuario}!
+
+Se te ha asignado un nuevo ticket:
+
+📋 Ticket: ${numero_ticket}
+🔧 Equipo: ${equipo_codigo || 'N/A'}
+⚠️ Tipo: ${tipo_incidente || 'No especificado'}
+📊 Prioridad: ${datos.prioridad === 1 ? '🔴 CRÍTICA' : datos.prioridad === 2 ? '🟡 ALTA' : '🟢 NORMAL'}
+
+Por favor, revisa los detalles en el sistema.
+
+📱 Responde cuando estés en camino.`;
 
     case 'emergencia':
-      return `🚨 *EMERGENCIA - ATENCIÓN URGENTE*\n\n` +
-             `${usuario.nombre}, se requiere tu atención INMEDIATA:\n\n` +
-             `📋 Ticket: *${ticket.numero_ticket}*\n` +
-             `🔴 PRIORIDAD CRÍTICA\n` +
-             `🔧 Equipo: ${equipoCodigo}\n` +
-             `⚠️ ${tipoIncidente}\n` +
-             `📝 ${ticket.breve_descripcion}\n\n` +
-             `⏰ Tiempo de respuesta: INMEDIATO\n\n` +
-             `_Confirma con *OK* que estás en camino_`
+      return `🚨 EMERGENCIA - ATENCIÓN URGENTE
+
+${nombre_usuario}, se requiere tu atención INMEDIATA:
+
+📋 Ticket: ${numero_ticket}
+🔴 PRIORIDAD CRÍTICA
+🔧 Equipo: ${equipo_codigo || 'N/A'}
+⚠️ Problema: ${tipo_incidente || 'Sin especificar'}
+
+⏰ Tiempo de respuesta esperado: INMEDIATO
+
+Por favor confirma recepción de este mensaje.`;
 
     case 'cambio_estado':
-      return `📊 *Actualización de Ticket*\n\n` +
-             `Ticket: *${ticket.numero_ticket}*\n` +
-             `Estado: *${ticket.estado}*\n` +
-             `Equipo: ${equipoCodigo}\n\n` +
-             `El estado del ticket ha sido actualizado.`
+      return `📌 Actualización de Ticket
+
+Ticket: ${numero_ticket}
+${datos.estado_anterior} → ${datos.estado_nuevo}
+
+${datos.comentario ? `💬 ${datos.comentario}` : ''}
+
+Revisa el sistema para más detalles.`;
 
     case 'recordatorio':
-      return `⏰ *Recordatorio*\n\n` +
-             `${usuario.nombre}, tienes un ticket pendiente:\n\n` +
-             `📋 *${ticket.numero_ticket}*\n` +
-             `🔧 ${equipoCodigo}\n` +
-             `Estado: ${ticket.estado}\n\n` +
-             `Por favor actualiza el progreso del ticket.`
+      return `⏰ Recordatorio
+
+Hola ${nombre_usuario}, tienes un ticket pendiente:
+
+📋 ${numero_ticket}
+🔧 ${equipo_codigo || 'N/A'}
+
+Este ticket lleva más de 2 horas sin actualización.
+
+Por favor actualiza el estado o agrega un comentario.`;
 
     case 'escalamiento':
-      return `⬆️ *Ticket Escalado*\n\n` +
-             `Se ha escalado el siguiente ticket a tu atención:\n\n` +
-             `📋 *${ticket.numero_ticket}*\n` +
-             `🔧 ${equipoCodigo}\n` +
-             `⚠️ ${tipoIncidente}\n\n` +
-             `Se requiere supervisión o apoyo adicional.`
+      return `⬆️ Escalamiento de Ticket
+
+${nombre_usuario}, el ticket ${numero_ticket} ha sido escalado a ti.
+
+Equipo: ${equipo_codigo}
+Estado: Requiere atención de supervisor
+
+Por favor revisa y asigna según corresponda.`;
 
     case 'cierre':
-      return `✅ *Ticket Cerrado*\n\n` +
-             `El ticket *${ticket.numero_ticket}* ha sido cerrado.\n\n` +
-             `Equipo: ${equipoCodigo}\n` +
-             `Gracias por tu trabajo!`
+      return `✅ Ticket Cerrado
+
+El ticket ${numero_ticket} ha sido marcado como cerrado.
+
+Gracias por tu trabajo, ${nombre_usuario}.
+
+${datos.comentario ? `💬 ${datos.comentario}` : ''}`;
 
     case 'comentario':
-      return `💬 *Nuevo Comentario*\n\n` +
-             `Hay un nuevo comentario en el ticket *${ticket.numero_ticket}*\n\n` +
-             `Revisa el ticket para más detalles.`
+      return `💬 Nuevo Comentario
+
+Ticket: ${numero_ticket}
+
+"${datos.comentario}"
+
+Revisa el ticket para responder.`;
 
     default:
-      return `🔔 Actualización del ticket *${ticket.numero_ticket}*`
+      return `Notificación para ticket ${numero_ticket}`;
   }
 }
 
 /**
- * Envía notificación por un canal específico
+ * Envía una notificación a un usuario
  */
-async function enviarPorCanal(
-  canal: CanalNotificacion,
-  usuario: any,
-  mensaje: string,
-  ticketId: string,
-  tipo: TipoNotificacion,
-  prioridad: number,
-  metadata?: Record<string, any>
-): Promise<void> {
-  
-  // Registrar notificación en BD
-  const { data: notificacion, error: notifError } = await supabase
-    .from('notificaciones')
-    .insert({
-      ticket_id: ticketId,
-      usuario_id: usuario.id,
-      tipo,
-      canal,
-      mensaje,
-      prioridad,
-      estado: 'pendiente',
-      metadata: metadata || {}
-    })
-    .select()
-    .single()
+export async function enviarNotificacion(
+  params: NotificacionParams
+): Promise<{ success: boolean; notificacion_id?: string; error?: string }> {
+  const { ticket_id, usuario_id, tipo, canal, prioridad = 3, datos_adicionales = {} } = params;
 
-  if (notifError) {
-    console.error('Error registrando notificación:', notifError)
-    return
-  }
-
-  // Enviar según el canal
   try {
-    if (canal === 'whatsapp') {
-      await enviarWhatsApp(usuario.telefono, mensaje, notificacion.id)
-    } else if (canal === 'email') {
-      await enviarEmail(usuario.email, `Ticket Notification - ${tipo}`, mensaje, notificacion.id)
+    // 1. Obtener datos del usuario
+    const { data: usuario, error: errorUsuario } = await supabase
+      .from('usuarios_autorizados')
+      .select('nombre, telefono, email, notificaciones_push, notificaciones_email')
+      .eq('id', usuario_id)
+      .single();
+
+    if (errorUsuario || !usuario) {
+      console.error('Usuario no encontrado:', errorUsuario);
+      return { success: false, error: 'Usuario no encontrado' };
     }
-  } catch (error) {
-    console.error(`Error enviando notificación por ${canal}:`, error)
-    
-    // Marcar como error
-    await supabase
+
+    // 2. Verificar preferencias de notificación
+    if (canal === 'whatsapp' && !usuario.notificaciones_push) {
+      console.log(`Usuario ${usuario.nombre} tiene notificaciones WhatsApp desactivadas`);
+      return { success: false, error: 'Notificaciones WhatsApp desactivadas' };
+    }
+
+    if (canal === 'email' && !usuario.notificaciones_email) {
+      console.log(`Usuario ${usuario.nombre} tiene notificaciones email desactivadas`);
+      return { success: false, error: 'Notificaciones email desactivadas' };
+    }
+
+    // 3. Obtener datos del ticket
+    const { data: ticket, error: errorTicket } = await supabase
+      .from('tickets')
+      .select(`
+        numero_ticket,
+        equipo_codigo,
+        prioridad,
+        tipo_incidente:tipos_incidente(nombre)
+      `)
+      .eq('id', ticket_id)
+      .single();
+
+    if (errorTicket || !ticket) {
+      console.error('Ticket no encontrado:', errorTicket);
+      return { success: false, error: 'Ticket no encontrado' };
+    }
+
+    // 4. Generar mensaje personalizado
+    const mensaje = generarMensaje(tipo, {
+      nombre_usuario: usuario.nombre,
+      numero_ticket: ticket.numero_ticket || 'SIN-NUMERO',
+      equipo_codigo: ticket.equipo_codigo,
+      tipo_incidente: ticket.tipo_incidente?.nombre,
+      prioridad: ticket.prioridad,
+      ...datos_adicionales
+    });
+
+    // 5. Crear registro de notificación
+    const { data: notificacion, error: errorNotif } = await supabase
       .from('notificaciones')
-      .update({
-        estado: 'error',
-        error_mensaje: String(error)
+      .insert({
+        ticket_id,
+        usuario_id,
+        tipo,
+        canal,
+        mensaje,
+        estado: 'pendiente',
+        prioridad,
+        metadata: {
+          telefono: usuario.telefono,
+          email: usuario.email,
+          ...datos_adicionales
+        }
       })
-      .eq('id', notificacion.id)
+      .select()
+      .single();
+
+    if (errorNotif || !notificacion) {
+      console.error('Error creando notificación:', errorNotif);
+      return { success: false, error: 'Error creando notificación' };
+    }
+
+    // 6. Enviar notificación según canal
+    if (canal === 'whatsapp') {
+      const enviado = await enviarWhatsApp(usuario.telefono, mensaje);
+      
+      if (enviado) {
+        await supabase
+          .from('notificaciones')
+          .update({ 
+            estado: 'enviado',
+            enviado_at: new Date().toISOString()
+          })
+          .eq('id', notificacion.id);
+      }
+    } else if (canal === 'email' && usuario.email) {
+      const enviado = await enviarEmail(usuario.email, `Ticket ${ticket.numero_ticket}`, mensaje);
+      
+      if (enviado) {
+        await supabase
+          .from('notificaciones')
+          .update({ 
+            estado: 'enviado',
+            enviado_at: new Date().toISOString()
+          })
+          .eq('id', notificacion.id);
+      }
+    }
+
+    console.log(`✅ Notificación ${tipo} enviada a ${usuario.nombre} vía ${canal}`);
+
+    return { 
+      success: true, 
+      notificacion_id: notificacion.id 
+    };
+
+  } catch (error) {
+    console.error('Error enviando notificación:', error);
+    return { 
+      success: false, 
+      error: 'Error inesperado al enviar notificación' 
+    };
   }
 }
 
 /**
- * Envía mensaje por WhatsApp
+ * Envía mensaje por WhatsApp (integración con Twilio)
  */
-async function enviarWhatsApp(
-  telefono: string,
-  mensaje: string,
-  notificacionId: string
-): Promise<void> {
-  
-  const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN
-  const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID
-
-  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
-    console.warn('⚠️ Credenciales de WhatsApp no configuradas')
-    return
-  }
-
-  const response = await fetch(
-    `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-    {
+async function enviarWhatsApp(telefono: string, mensaje: string): Promise<boolean> {
+  try {
+    // Llamar al API route de Next.js que maneja Twilio
+    const response = await fetch('/api/whatsapp/send', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        messaging_product: 'whatsapp',
         to: telefono,
-        type: 'text',
-        text: { body: mensaje }
+        message: mensaje
       })
+    });
+
+    if (!response.ok) {
+      console.error('Error enviando WhatsApp:', await response.text());
+      return false;
     }
-  )
 
-  const data = await response.json()
-
-  if (!response.ok) {
-    throw new Error(`WhatsApp API error: ${JSON.stringify(data)}`)
+    return true;
+  } catch (error) {
+    console.error('Error en enviarWhatsApp:', error);
+    return false;
   }
-
-  // Actualizar estado de notificación
-  await supabase
-    .from('notificaciones')
-    .update({
-      estado: 'enviado',
-      enviado_at: new Date().toISOString(),
-      metadata: { message_id: data.messages?.[0]?.id }
-    })
-    .eq('id', notificacionId)
-
-  console.log('✅ Notificación WhatsApp enviada:', data.messages?.[0]?.id)
 }
 
 /**
- * Envía email (requiere servicio de email configurado)
+ * Envía email (placeholder - implementar con SendGrid/Resend)
  */
 async function enviarEmail(
-  email: string,
-  asunto: string,
-  mensaje: string,
-  notificacionId: string
-): Promise<void> {
-  
-  // TODO: Integrar con servicio de email (SendGrid, Resend, etc.)
-  console.log('📧 Email a enviar:', { email, asunto, mensaje })
+  email: string, 
+  asunto: string, 
+  mensaje: string
+): Promise<boolean> {
+  try {
+    // TODO: Implementar con SendGrid o Resend
+    console.log(`📧 Email a ${email}: ${asunto}`);
+    console.log(mensaje);
+    
+    // Por ahora solo log, luego integrar proveedor email real
+    return true;
+  } catch (error) {
+    console.error('Error en enviarEmail:', error);
+    return false;
+  }
+}
 
-  // Por ahora solo registramos como enviado
+/**
+ * Envía recordatorios para tickets antiguos sin actualización
+ */
+export async function enviarRecordatoriosAutomaticos(): Promise<void> {
+  try {
+    // Buscar tickets asignados sin actualización en 2+ horas
+    const dosHorasAtras = new Date();
+    dosHorasAtras.setHours(dosHorasAtras.getHours() - 2);
+
+    const { data: tickets, error } = await supabase
+      .from('tickets')
+      .select('id, asignado_a, updated_at')
+      .eq('estado', 'asignado')
+      .lt('updated_at', dosHorasAtras.toISOString());
+
+    if (error || !tickets || tickets.length === 0) {
+      return;
+    }
+
+    console.log(`📬 Enviando ${tickets.length} recordatorios...`);
+
+    for (const ticket of tickets) {
+      if (ticket.asignado_a) {
+        await enviarNotificacion({
+          ticket_id: ticket.id,
+          usuario_id: ticket.asignado_a,
+          tipo: 'recordatorio',
+          canal: 'whatsapp',
+          prioridad: 3
+        });
+      }
+    }
+
+  } catch (error) {
+    console.error('Error enviando recordatorios:', error);
+  }
+}
+
+/**
+ * Marca notificación como leída
+ */
+export async function marcarNotificacionLeida(
+  notificacion_id: string
+): Promise<void> {
   await supabase
     .from('notificaciones')
-    .update({
-      estado: 'enviado',
-      enviado_at: new Date().toISOString()
+    .update({ 
+      estado: 'leido',
+      leido_at: new Date().toISOString()
     })
-    .eq('id', notificacionId)
-}
-
-/**
- * Notificar asignación de ticket a técnico
- */
-export async function notificarAsignacion(
-  ticketId: string,
-  tecnicoId: string,
-  esEmergencia: boolean = false
-): Promise<void> {
-  
-  await enviarNotificacion({
-    ticketId,
-    usuarioId: tecnicoId,
-    tipo: esEmergencia ? 'emergencia' : 'asignacion',
-    prioridad: esEmergencia ? 1 : 2
-  })
-}
-
-/**
- * Notificar cambio de estado
- */
-export async function notificarCambioEstado(
-  ticketId: string,
-  usuarioId: string,
-  nuevoEstado: string
-): Promise<void> {
-  
-  await enviarNotificacion({
-    ticketId,
-    usuarioId,
-    tipo: nuevoEstado === 'cerrado' ? 'cierre' : 'cambio_estado',
-    prioridad: 3,
-    metadata: { estado: nuevoEstado }
-  })
-}
-
-/**
- * Enviar recordatorio de tickets pendientes
- */
-export async function enviarRecordatoriosPendientes(): Promise<void> {
-  // Buscar tickets asignados hace más de 2 horas sin actualización
-  const dosHorasAtras = new Date()
-  dosHorasAtras.setHours(dosHorasAtras.getHours() - 2)
-
-  const { data: ticketsPendientes } = await supabase
-    .from('tickets')
-    .select('id, asignado_a')
-    .eq('estado', 'asignado')
-    .lt('updated_at', dosHorasAtras.toISOString())
-    .not('asignado_a', 'is', null)
-
-  if (!ticketsPendientes) return
-
-  for (const ticket of ticketsPendientes) {
-    await enviarNotificacion({
-      ticketId: ticket.id,
-      usuarioId: ticket.asignado_a,
-      tipo: 'recordatorio',
-      prioridad: 3
-    })
-  }
-}
-
-// Helpers
-function obtenerNombrePrioridad(prioridad: number): string {
-  const nombres: Record<number, string> = {
-    1: 'CRÍTICA',
-    2: 'Alta',
-    3: 'Media',
-    4: 'Baja'
-  }
-  return nombres[prioridad] || 'Media'
+    .eq('id', notificacion_id);
 }
