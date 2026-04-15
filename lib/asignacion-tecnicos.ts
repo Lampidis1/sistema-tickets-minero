@@ -1,321 +1,362 @@
-import { supabase } from './supabase'
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs';
+import { enviarNotificacion } from './notificaciones';
 
-export interface TecnicoDisponible {
-  id: string
-  nombre: string
-  telefono: string
-  email?: string
-  especialidad?: string
-  rol: string
-  tickets_activos: number
-  prioridad_asignacion: number
-  acepta_emergencias: boolean
-  turno_actual?: string
-  score: number // Score calculado para asignación
+const supabase = createClientComponentClient();
+
+export interface Tecnico {
+  id: string;
+  nombre: string;
+  telefono: string;
+  especialidad: string | null;
+  prioridad_asignacion: number;
+  tickets_activos: number;
+  acepta_emergencias: boolean;
+  disponible: boolean;
+  turno_actual: string | null;
+  ultima_asignacion: string | null;
+  rol: string;
+}
+
+export interface ScoringResult {
+  tecnico_id: string;
+  tecnico_nombre: string;
+  score: number;
+  razon: string;
 }
 
 /**
- * Asigna automáticamente un técnico al ticket basado en:
- * - Especialidad del técnico
- * - Carga actual de trabajo
- * - Prioridad de asignación
- * - Disponibilidad
- * - Si es emergencia, solo técnicos que aceptan emergencias
+ * Calcula un score para cada técnico disponible
+ * Score más alto = mejor candidato
+ */
+export function calcularScore(
+  tecnico: Tecnico,
+  tipo_incidente: string,
+  es_emergencia: boolean
+): ScoringResult {
+  let score = 100;
+  let razones: string[] = [];
+
+  // Factor 1: Prioridad de asignación (1=máxima, 10=mínima)
+  const prioridad_puntos = (11 - tecnico.prioridad_asignacion) * 10;
+  score += prioridad_puntos;
+  razones.push(`Prioridad ${tecnico.prioridad_asignacion}: +${prioridad_puntos}pts`);
+
+  // Factor 2: Carga actual de trabajo (penalización por tickets activos)
+  const carga_penalizacion = tecnico.tickets_activos * 15;
+  score -= carga_penalizacion;
+  razones.push(`${tecnico.tickets_activos} tickets activos: -${carga_penalizacion}pts`);
+
+  // Factor 3: Especialidad coincide con tipo de incidente
+  if (tecnico.especialidad) {
+    const especialidades_map: Record<string, string[]> = {
+      eléctrico: ['Falla eléctrica', 'Sistema eléctrico', 'Iluminación'],
+      mecánico: ['Falla mecánica', 'Motor', 'Transmisión', 'Frenos'],
+      hidráulico: ['Falla hidráulica', 'Sistema hidráulico', 'Cilindros'],
+      neumático: ['Neumáticos', 'Sistema de aire', 'Suspensión neumática']
+    };
+
+    const tipos_relacionados = especialidades_map[tecnico.especialidad.toLowerCase()] || [];
+    
+    if (tipos_relacionados.some(tipo => 
+      tipo_incidente.toLowerCase().includes(tipo.toLowerCase())
+    )) {
+      score += 30;
+      razones.push(`Especialidad coincide: +30pts`);
+    }
+  }
+
+  // Factor 4: Es supervisor (mayor capacidad de gestión)
+  if (tecnico.rol === 'supervisor') {
+    score += 10;
+    razones.push('Es supervisor: +10pts');
+  }
+
+  // Factor 5: Emergencia y acepta emergencias
+  if (es_emergencia) {
+    if (tecnico.acepta_emergencias) {
+      score += 50;
+      razones.push('Acepta emergencias: +50pts');
+    } else {
+      score -= 100; // Penalización fuerte si no acepta emergencias
+      razones.push('No acepta emergencias: -100pts');
+    }
+  }
+
+  // Factor 6: Última asignación reciente (distribuir carga)
+  if (tecnico.ultima_asignacion) {
+    const ultima = new Date(tecnico.ultima_asignacion);
+    const ahora = new Date();
+    const minutos_desde_ultima = (ahora.getTime() - ultima.getTime()) / 60000;
+
+    if (minutos_desde_ultima < 30) {
+      score -= 20;
+      razones.push('Asignado recientemente: -20pts');
+    }
+  }
+
+  // Factor 7: No disponible
+  if (!tecnico.disponible) {
+    score -= 200; // Penalización muy fuerte
+    razones.push('No disponible: -200pts');
+  }
+
+  return {
+    tecnico_id: tecnico.id,
+    tecnico_nombre: tecnico.nombre,
+    score: Math.max(0, score), // No permitir scores negativos
+    razon: razones.join(', ')
+  };
+}
+
+/**
+ * Asigna automáticamente un técnico a un ticket
  */
 export async function asignarTecnicoAutomatico(
-  ticketId: string,
-  esEmergencia: boolean = false
-): Promise<TecnicoDisponible | null> {
-  
-  // Obtener información del ticket
-  const { data: ticket, error: ticketError } = await supabase
-    .from('tickets')
-    .select('*, tipo_incidente:tipos_incidente(*)')
-    .eq('id', ticketId)
-    .single()
+  ticket_id: string,
+  tipo_incidente: string,
+  es_emergencia: boolean = false
+): Promise<{ success: boolean; tecnico?: Tecnico; error?: string }> {
+  try {
+    // 1. Obtener todos los técnicos disponibles
+    const { data: tecnicos, error: errorTecnicos } = await supabase
+      .from('usuarios_autorizados')
+      .select('*')
+      .in('rol', ['técnico', 'supervisor'])
+      .eq('activo', true);
 
-  if (ticketError || !ticket) {
-    console.error('Error obteniendo ticket:', ticketError)
-    return null
-  }
-
-  // Determinar especialidad requerida según tipo de incidente
-  const especialidadRequerida = determinarEspecialidad(ticket.tipo_incidente?.categoria)
-
-  // Buscar técnicos disponibles
-  const tecnicos = await buscarTecnicosDisponibles(
-    especialidadRequerida,
-    esEmergencia,
-    ticket.turno
-  )
-
-  if (!tecnicos || tecnicos.length === 0) {
-    console.warn('⚠️ No hay técnicos disponibles')
-    return null
-  }
-
-  // Calcular score para cada técnico y ordenar
-  const tecnicosConScore = tecnicos.map(t => ({
-    ...t,
-    score: calcularScoreAsignacion(t, especialidadRequerida, esEmergencia)
-  })).sort((a, b) => b.score - a.score) // Mayor score = mejor candidato
-
-  // Seleccionar el mejor técnico
-  const tecnicoSeleccionado = tecnicosConScore[0]
-
-  // Asignar el ticket
-  await asignarTicketATecnico(ticketId, tecnicoSeleccionado.id)
-
-  return tecnicoSeleccionado
-}
-
-/**
- * Busca técnicos disponibles según criterios
- */
-async function buscarTecnicosDisponibles(
-  especialidad?: string,
-  soloEmergencias: boolean = false,
-  turno?: string
-): Promise<any[]> {
-  
-  let query = supabase
-    .from('usuarios_autorizados')
-    .select('*')
-    .eq('activo', true)
-    .eq('disponible', true)
-    .in('rol', ['tecnico', 'supervisor'])
-
-  // Si es emergencia, solo técnicos que aceptan emergencias
-  if (soloEmergencias) {
-    query = query.eq('acepta_emergencias', true)
-  }
-
-  // Filtrar por especialidad si se especifica
-  if (especialidad) {
-    query = query.or(`especialidad.ilike.%${especialidad}%,especialidad.is.null`)
-  }
-
-  // Filtrar por turno si se especifica
-  if (turno) {
-    query = query.or(`turno_actual.eq.${turno},turno_actual.is.null`)
-  }
-
-  const { data, error } = await query
-
-  if (error) {
-    console.error('Error buscando técnicos:', error)
-    return []
-  }
-
-  return data || []
-}
-
-/**
- * Calcula score de asignación para un técnico
- * Mayor score = mejor candidato
- */
-function calcularScoreAsignacion(
-  tecnico: any,
-  especialidadRequerida?: string,
-  esEmergencia: boolean = false
-): number {
-  let score = 100
-
-  // 1. Prioridad base del técnico (1-10, donde 1 es más prioritario)
-  score += (11 - tecnico.prioridad_asignacion) * 10
-
-  // 2. Carga de trabajo (penalizar por tickets activos)
-  score -= tecnico.tickets_activos * 15
-
-  // 3. Especialidad coincidente (bonus)
-  if (especialidadRequerida && tecnico.especialidad) {
-    if (tecnico.especialidad.toLowerCase().includes(especialidadRequerida.toLowerCase())) {
-      score += 30 // Gran bonus por especialidad exacta
+    if (errorTecnicos) {
+      console.error('Error obteniendo técnicos:', errorTecnicos);
+      return { success: false, error: 'Error obteniendo técnicos disponibles' };
     }
-  }
 
-  // 4. Supervisor tiene bonus (puede coordinar mejor)
-  if (tecnico.rol === 'supervisor') {
-    score += 10
-  }
-
-  // 5. Si es emergencia y acepta emergencias, gran bonus
-  if (esEmergencia && tecnico.acepta_emergencias) {
-    score += 50
-  }
-
-  // 6. Penalizar si se le asignó muy recientemente
-  if (tecnico.ultima_asignacion) {
-    const minutosDesdeUltimaAsignacion = 
-      (Date.now() - new Date(tecnico.ultima_asignacion).getTime()) / 1000 / 60
-    
-    if (minutosDesdeUltimaAsignacion < 30) {
-      score -= 20 // Penalizar asignaciones muy seguidas
+    if (!tecnicos || tecnicos.length === 0) {
+      return { success: false, error: 'No hay técnicos disponibles' };
     }
-  }
 
-  return Math.max(0, score) // No permitir scores negativos
+    // 2. Calcular score para cada técnico
+    const scores: ScoringResult[] = tecnicos.map(tec => 
+      calcularScore(tec as Tecnico, tipo_incidente, es_emergencia)
+    );
+
+    // 3. Ordenar por score (mayor a menor)
+    scores.sort((a, b) => b.score - a.score);
+
+    // 4. Seleccionar el mejor candidato
+    const mejor = scores[0];
+
+    if (mejor.score <= 0) {
+      return { 
+        success: false, 
+        error: 'Ningún técnico cumple con los criterios mínimos' 
+      };
+    }
+
+    const tecnico_seleccionado = tecnicos.find(t => t.id === mejor.tecnico_id);
+
+    if (!tecnico_seleccionado) {
+      return { success: false, error: 'Error en selección de técnico' };
+    }
+
+    // 5. Asignar ticket al técnico
+    const { error: errorUpdate } = await supabase
+      .from('tickets')
+      .update({
+        asignado_a: tecnico_seleccionado.id,
+        nombre_tecnico: tecnico_seleccionado.nombre,
+        estado: 'asignado',
+        fecha_asignacion: new Date().toISOString()
+      })
+      .eq('id', ticket_id);
+
+    if (errorUpdate) {
+      console.error('Error asignando ticket:', errorUpdate);
+      return { success: false, error: 'Error al asignar ticket' };
+    }
+
+    // 6. Incrementar contador de tickets activos
+    const { error: errorIncrement } = await supabase.rpc(
+      'incrementar_tickets_activos',
+      { usuario_id: tecnico_seleccionado.id }
+    );
+
+    if (errorIncrement) {
+      console.error('Error incrementando contador:', errorIncrement);
+    }
+
+    // 7. Actualizar última asignación
+    await supabase
+      .from('usuarios_autorizados')
+      .update({ ultima_asignacion: new Date().toISOString() })
+      .eq('id', tecnico_seleccionado.id);
+
+    // 8. Enviar notificación
+    await enviarNotificacion({
+      ticket_id,
+      usuario_id: tecnico_seleccionado.id,
+      tipo: es_emergencia ? 'emergencia' : 'asignacion',
+      canal: 'whatsapp',
+      prioridad: es_emergencia ? 1 : 3
+    });
+
+    // 9. Registrar en historial
+    await supabase
+      .from('historial_estados')
+      .insert({
+        ticket_id,
+        estado_anterior: 'nuevo',
+        estado_nuevo: 'asignado',
+        usuario_id: tecnico_seleccionado.id,
+        comentario: `Asignado automáticamente. Score: ${mejor.score}. ${mejor.razon}`
+      });
+
+    console.log(`✅ Ticket ${ticket_id} asignado a ${tecnico_seleccionado.nombre}`);
+    console.log(`📊 Score: ${mejor.score} - ${mejor.razon}`);
+
+    return { 
+      success: true, 
+      tecnico: tecnico_seleccionado as Tecnico 
+    };
+
+  } catch (error) {
+    console.error('Error en asignación automática:', error);
+    return { 
+      success: false, 
+      error: 'Error inesperado en asignación automática' 
+    };
+  }
 }
 
 /**
- * Asigna el ticket al técnico y actualiza contadores
+ * Reasigna un ticket a otro técnico
  */
-async function asignarTicketATecnico(
-  ticketId: string,
-  tecnicoId: string
-): Promise<void> {
-  
-  const ahora = new Date().toISOString()
+export async function reasignarTicket(
+  ticket_id: string,
+  nuevo_tecnico_id: string,
+  usuario_que_reasigna_id: string,
+  motivo?: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // 1. Obtener ticket actual
+    const { data: ticket, error: errorTicket } = await supabase
+      .from('tickets')
+      .select('asignado_a, estado')
+      .eq('id', ticket_id)
+      .single();
 
-  // 1. Actualizar ticket
-  await supabase
-    .from('tickets')
-    .update({
-      asignado_a: tecnicoId,
-      estado: 'asignado',
-      fecha_asignacion: ahora,
-      updated_at: ahora
-    })
-    .eq('id', ticketId)
+    if (errorTicket || !ticket) {
+      return { success: false, error: 'Ticket no encontrado' };
+    }
 
-  // 2. Incrementar contador de tickets activos del técnico
-  await supabase.rpc('incrementar_tickets_activos', {
-    usuario_id: tecnicoId
-  })
+    const tecnico_anterior_id = ticket.asignado_a;
 
-  // 3. Actualizar última asignación
-  await supabase
-    .from('usuarios_autorizados')
-    .update({
-      ultima_asignacion: ahora
-    })
-    .eq('id', tecnicoId)
+    // 2. Obtener datos del nuevo técnico
+    const { data: nuevoTecnico, error: errorNuevoTec } = await supabase
+      .from('usuarios_autorizados')
+      .select('nombre, disponible')
+      .eq('id', nuevo_tecnico_id)
+      .single();
 
-  // 4. Registrar en historial
-  await supabase
-    .from('historial_estados')
-    .insert({
-      ticket_id: ticketId,
-      estado_anterior: 'nuevo',
-      estado_nuevo: 'asignado',
-      usuario_id: tecnicoId,
-      comentario: 'Asignación automática del sistema'
-    })
+    if (errorNuevoTec || !nuevoTecnico) {
+      return { success: false, error: 'Técnico no encontrado' };
+    }
+
+    if (!nuevoTecnico.disponible) {
+      return { success: false, error: 'Técnico no está disponible' };
+    }
+
+    // 3. Actualizar ticket
+    const { error: errorUpdate } = await supabase
+      .from('tickets')
+      .update({
+        asignado_a: nuevo_tecnico_id,
+        nombre_tecnico: nuevoTecnico.nombre,
+        fecha_asignacion: new Date().toISOString()
+      })
+      .eq('id', ticket_id);
+
+    if (errorUpdate) {
+      return { success: false, error: 'Error al reasignar ticket' };
+    }
+
+    // 4. Decrementar contador del técnico anterior (si existía)
+    if (tecnico_anterior_id) {
+      await supabase.rpc('decrementar_tickets_activos', {
+        usuario_id: tecnico_anterior_id
+      });
+    }
+
+    // 5. Incrementar contador del nuevo técnico
+    await supabase.rpc('incrementar_tickets_activos', {
+      usuario_id: nuevo_tecnico_id
+    });
+
+    // 6. Actualizar última asignación
+    await supabase
+      .from('usuarios_autorizados')
+      .update({ ultima_asignacion: new Date().toISOString() })
+      .eq('id', nuevo_tecnico_id);
+
+    // 7. Enviar notificación al nuevo técnico
+    await enviarNotificacion({
+      ticket_id,
+      usuario_id: nuevo_tecnico_id,
+      tipo: 'asignacion',
+      canal: 'whatsapp',
+      prioridad: 3
+    });
+
+    // 8. Registrar en historial
+    await supabase
+      .from('historial_estados')
+      .insert({
+        ticket_id,
+        estado_anterior: ticket.estado,
+        estado_nuevo: ticket.estado,
+        usuario_id: usuario_que_reasigna_id,
+        comentario: `Reasignado a ${nuevoTecnico.nombre}. ${motivo || 'Sin motivo especificado'}`
+      });
+
+    return { success: true };
+
+  } catch (error) {
+    console.error('Error en reasignación:', error);
+    return { success: false, error: 'Error inesperado en reasignación' };
+  }
 }
 
 /**
  * Libera un técnico cuando cierra un ticket
  */
-export async function liberarTecnico(ticketId: string): Promise<void> {
-  // Obtener el técnico asignado
-  const { data: ticket } = await supabase
-    .from('tickets')
-    .select('asignado_a')
-    .eq('id', ticketId)
-    .single()
-
-  if (ticket?.asignado_a) {
-    // Decrementar contador
-    await supabase.rpc('decrementar_tickets_activos', {
-      usuario_id: ticket.asignado_a
-    })
-  }
-}
-
-/**
- * Determina la especialidad requerida según categoría del incidente
- */
-function determinarEspecialidad(categoria?: string): string | undefined {
-  if (!categoria) return undefined
-
-  const mapeoEspecialidades: Record<string, string> = {
-    'electrico': 'eléctrico',
-    'mecanico': 'mecánico',
-    'hidraulico': 'hidráulico',
-    'neumaticos': 'neumáticos',
-    'instrumentacion': 'instrumentación',
-    'lubricacion': 'lubricación'
-  }
-
-  return mapeoEspecialidades[categoria.toLowerCase()]
-}
-
-/**
- * Reasignar ticket manualmente a otro técnico
- */
-export async function reasignarTicket(
-  ticketId: string,
-  nuevoTecnicoId: string,
-  usuarioQueReasigna: string,
-  motivo?: string
+export async function liberarTecnico(
+  ticket_id: string,
+  tecnico_id: string
 ): Promise<void> {
-  
-  // Obtener técnico actual
-  const { data: ticket } = await supabase
-    .from('tickets')
-    .select('asignado_a')
-    .eq('id', ticketId)
-    .single()
-
-  const tecnicoAnterior = ticket?.asignado_a
-
-  // Decrementar contador del técnico anterior
-  if (tecnicoAnterior) {
+  try {
     await supabase.rpc('decrementar_tickets_activos', {
-      usuario_id: tecnicoAnterior
-    })
+      usuario_id: tecnico_id
+    });
+
+    console.log(`✅ Técnico ${tecnico_id} liberado del ticket ${ticket_id}`);
+  } catch (error) {
+    console.error('Error liberando técnico:', error);
   }
-
-  // Asignar al nuevo técnico
-  const ahora = new Date().toISOString()
-
-  await supabase
-    .from('tickets')
-    .update({
-      asignado_a: nuevoTecnicoId,
-      estado: 'asignado',
-      fecha_asignacion: ahora,
-      updated_at: ahora
-    })
-    .eq('id', ticketId)
-
-  // Incrementar contador del nuevo técnico
-  await supabase.rpc('incrementar_tickets_activos', {
-    usuario_id: nuevoTecnicoId
-  })
-
-  await supabase
-    .from('usuarios_autorizados')
-    .update({ ultima_asignacion: ahora })
-    .eq('id', nuevoTecnicoId)
-
-  // Registrar en historial
-  await supabase
-    .from('historial_estados')
-    .insert({
-      ticket_id: ticketId,
-      estado_anterior: 'asignado',
-      estado_nuevo: 'asignado',
-      usuario_id: usuarioQueReasigna,
-      comentario: `Reasignado de técnico${motivo ? ': ' + motivo : ''}`
-    })
 }
 
 /**
- * Obtener estadísticas de carga de técnicos
+ * Obtiene la carga actual de todos los técnicos
  */
-export async function obtenerCargaTecnicos(): Promise<any[]> {
+export async function obtenerCargaTecnicos(): Promise<Tecnico[]> {
   const { data, error } = await supabase
     .from('usuarios_autorizados')
-    .select('id, nombre, rol, especialidad, tickets_activos, disponible, acepta_emergencias')
-    .in('rol', ['tecnico', 'supervisor'])
+    .select('*')
+    .in('rol', ['técnico', 'supervisor'])
     .eq('activo', true)
-    .order('tickets_activos', { ascending: false })
+    .order('tickets_activos', { ascending: false });
 
   if (error) {
-    console.error('Error obteniendo carga de técnicos:', error)
-    return []
+    console.error('Error obteniendo carga de técnicos:', error);
+    return [];
   }
 
-  return data || []
+  return (data as Tecnico[]) || [];
 }
